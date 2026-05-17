@@ -171,23 +171,24 @@ app.post("/api/clip", async (req, res) => {
       const ytArgs = [
         url,
       ];
-      // Format selection: always prefer English audio. Falls back to any audio
-      // when the video isn't multi-language tagged (most videos don't tag a
-      // language at all, in which case the second branch matches).
+      // Format selection: always pick the ORIGINAL audio track (the one the
+      // creator uploaded), never a YouTube dub. yt-dlp tags the original
+      // track with "original" in its format_note (e.g. "English (US) original
+      // (default), medium, m4a_dash"). The second branch is the fallback for
+      // single-language videos where no audio is tagged "original".
       if (formatId) {
         // User picked a specific (usually video-only) format. Pair it with the
-        // best English audio if available, else best audio of any language.
+        // original audio track, falling back to best m4a if not tagged.
         const isCombined = String(formatId).includes('+');
         const spec = isCombined
           ? String(formatId)
-          : `${formatId}+ba[language^=en]/${formatId}+ba[language=en-US]/${formatId}+ba/${formatId}`;
+          : `${formatId}+ba[format_note*=original]/${formatId}+ba[ext=m4a]/${formatId}+ba/${formatId}`;
         ytArgs.push("-f", spec);
       } else {
         ytArgs.push(
           "-f",
           [
-            "bv[ext=mp4][vcodec^=avc1][height<=?1080][fps<=?60]+ba[ext=m4a][language^=en]",
-            "bv[ext=mp4][vcodec^=avc1][height<=?1080][fps<=?60]+ba[ext=m4a][language=en-US]",
+            "bv[ext=mp4][vcodec^=avc1][height<=?1080][fps<=?60]+ba[ext=m4a][format_note*=original]",
             "bv[ext=mp4][vcodec^=avc1][height<=?1080][fps<=?60]+ba[ext=m4a]",
             "best[ext=mp4][vcodec^=avc1][height<=?1080]",
           ].join('/')
@@ -202,8 +203,6 @@ app.post("/api/clip", async (req, res) => {
         "mp4",
         "--no-check-certificates",
         "--no-warnings",
-        "--extractor-args",
-        "youtube:lang=en",
         "--add-header",
         "referer:youtube.com",
         "--add-header",
