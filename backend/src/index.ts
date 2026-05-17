@@ -150,10 +150,27 @@ app.post("/api/clip", async (req, res) => {
       const ytArgs = [
         url,
       ];
+      // Format selection: always prefer English audio. Falls back to any audio
+      // when the video isn't multi-language tagged (most videos don't tag a
+      // language at all, in which case the second branch matches).
       if (formatId) {
-        ytArgs.push("-f", formatId);
+        // User picked a specific (usually video-only) format. Pair it with the
+        // best English audio if available, else best audio of any language.
+        const isCombined = String(formatId).includes('+');
+        const spec = isCombined
+          ? String(formatId)
+          : `${formatId}+ba[language^=en]/${formatId}+ba[language=en-US]/${formatId}+ba/${formatId}`;
+        ytArgs.push("-f", spec);
       } else {
-        ytArgs.push("-f", "bv[ext=mp4][vcodec^=avc1][height<=?1080][fps<=?60]+ba[ext=m4a]/best[ext=mp4][vcodec^=avc1][height<=?1080]");
+        ytArgs.push(
+          "-f",
+          [
+            "bv[ext=mp4][vcodec^=avc1][height<=?1080][fps<=?60]+ba[ext=m4a][language^=en]",
+            "bv[ext=mp4][vcodec^=avc1][height<=?1080][fps<=?60]+ba[ext=m4a][language=en-US]",
+            "bv[ext=mp4][vcodec^=avc1][height<=?1080][fps<=?60]+ba[ext=m4a]",
+            "best[ext=mp4][vcodec^=avc1][height<=?1080]",
+          ].join('/')
+        );
       }
       ytArgs.push(
         "--download-sections",
@@ -164,6 +181,8 @@ app.post("/api/clip", async (req, res) => {
         "mp4",
         "--no-check-certificates",
         "--no-warnings",
+        "--extractor-args",
+        "youtube:lang=en",
         "--add-header",
         "referer:youtube.com",
         "--add-header",
