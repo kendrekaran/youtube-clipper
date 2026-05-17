@@ -14,7 +14,15 @@ export async function DELETE(
     const bucketName = process.env.SUPABASE_BUCKET || 'videos';
     
     if (!supabaseUrl || !supabaseServiceKey) {
-      return NextResponse.json({ error: 'Supabase not configured' }, { status: 500 });
+      // LOCAL-DEV: no Supabase configured. Just ask the backend to clean up
+      // its local file + in-memory job and return success.
+      const backendUrl = process.env.BACKEND_API_URL || 'http://localhost:3001';
+      try {
+        await fetch(`${backendUrl}/api/clip/${id}/cleanup`, { method: 'DELETE' });
+      } catch (e) {
+        console.warn('[cleanup] backend cleanup call failed:', e);
+      }
+      return NextResponse.json({ success: true, mode: 'local-dev' });
     }
     
     const supabase = createClient(supabaseUrl, supabaseServiceKey, {

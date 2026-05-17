@@ -5,7 +5,8 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
-  const backendBase = `${process.env.BACKEND_API_URL}/api/clip/${id}`;
+  const backendUrl = process.env.BACKEND_API_URL || "http://localhost:3001";
+  const backendBase = `${backendUrl}/api/clip/${id}`;
   const url = new URL(request.url);
   // Preserve query string (e.g. ?download=1)
   const target = backendBase + url.search;

@@ -4,20 +4,34 @@ import cors from "cors";
 import { spawn } from "child_process";
 import path from "path";
 import fs from "fs";
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 dotenv.config();
 
-// --- Supabase setup ---
-const supabaseUrl = process.env.SUPABASE_URL as string;
-const supabaseServiceKey = process.env.SUPABASE_SERVICE_KEY as string;
+// --- Supabase setup (optional for local dev) ---
+const supabaseUrl = process.env.SUPABASE_URL as string | undefined;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_KEY as string | undefined;
 const bucketName = process.env.SUPABASE_BUCKET || 'videos';
-if (!supabaseUrl || !supabaseServiceKey) {
-  throw new Error('Supabase credentials are not set in environment variables');
+const SUPABASE_ENABLED = Boolean(supabaseUrl && supabaseServiceKey);
+const supabase: SupabaseClient | null = SUPABASE_ENABLED
+  ? createClient(supabaseUrl as string, supabaseServiceKey as string, {
+      auth: { persistSession: false },
+    })
+  : null;
+if (!SUPABASE_ENABLED) {
+  console.warn('[startup] Supabase env vars not set — running in LOCAL-ONLY mode (no cloud upload, no DB).');
 }
-const supabase = createClient(supabaseUrl, supabaseServiceKey, {
-  auth: { persistSession: false }
-});
+
+// In-memory job store used when Supabase is disabled
+const localJobs = new Map<string, {
+  id: string;
+  user_id: string;
+  status: 'processing' | 'ready' | 'error';
+  storage_path?: string;
+  public_url?: string;
+  error?: string;
+  created_at: string;
+}>();
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -97,23 +111,28 @@ app.post("/api/clip", async (req, res) => {
 
   const id = createJobId();
   const outputPath = path.join(uploadsDir, `clip-${id}.mp4`);
-  
+
   const initialJobData = {
     id,
     user_id: userId,
-    status: 'processing',
+    status: 'processing' as const,
+    created_at: new Date().toISOString(),
   };
 
-  const { error: insertError } = await supabase
-    .from('jobs')
-    .insert([initialJobData]);
+  if (SUPABASE_ENABLED && supabase) {
+    const { error: insertError } = await supabase
+      .from('jobs')
+      .insert([{ id, user_id: userId, status: 'processing' }]);
 
-  if (insertError) {
-    console.error(`[job ${id}] failed to create job in database`, insertError);
-    return res.status(500).json({ error: 'Failed to create job' });
+    if (insertError) {
+      console.error(`[job ${id}] failed to create job in database`, insertError);
+      return res.status(500).json({ error: 'Failed to create job' });
+    }
+  } else {
+    localJobs.set(id, initialJobData);
   }
 
-  console.log(`[job ${id}] created and saved to database.`);
+  console.log(`[job ${id}] created (${SUPABASE_ENABLED ? 'supabase' : 'local'}).`);
 
   (async () => {
     let finalJobStatus: { [key: string]: any } = {};
@@ -262,31 +281,40 @@ app.post("/api/clip", async (req, res) => {
         await fs.promises.unlink(subPath).catch(() => {});
       }
 
-      // ---- Upload processed clip to Supabase ----
+      // ---- Upload processed clip to Supabase (if enabled) ----
       const objectPath = `clip-${id}.mp4`;
-      console.log(`[job ${id}] uploading to Supabase: ${objectPath}`);
-      const fileBuffer = await fs.promises.readFile(outputPath);
-      const { error: uploadError } = await supabase.storage
-        .from(bucketName)
-        .upload(objectPath, fileBuffer, {
-          contentType: 'video/mp4',
-          upsert: true,
-        });
-      if (uploadError) throw uploadError;
+      if (SUPABASE_ENABLED && supabase) {
+        console.log(`[job ${id}] uploading to Supabase: ${objectPath}`);
+        const fileBuffer = await fs.promises.readFile(outputPath);
+        const { error: uploadError } = await supabase.storage
+          .from(bucketName)
+          .upload(objectPath, fileBuffer, {
+            contentType: 'video/mp4',
+            upsert: true,
+          });
+        if (uploadError) throw uploadError;
 
-      console.log(`[job ${id}] upload successful, getting public URL`);
-      const { data: pub } = supabase.storage
-        .from(bucketName)
-        .getPublicUrl(objectPath);
+        console.log(`[job ${id}] upload successful, getting public URL`);
+        const { data: pub } = supabase.storage
+          .from(bucketName)
+          .getPublicUrl(objectPath);
 
-      // Remove local file after upload
-      await fs.promises.unlink(outputPath).catch(() => {});
+        // Remove local file after upload
+        await fs.promises.unlink(outputPath).catch(() => {});
 
-      finalJobStatus = {
-        storage_path: objectPath,
-        public_url: pub.publicUrl,
-        status: 'ready',
-      };
+        finalJobStatus = {
+          storage_path: objectPath,
+          public_url: pub.publicUrl,
+          status: 'ready',
+        };
+      } else {
+        // Local-only mode: keep the file on disk and serve via /api/clip/:id/file
+        finalJobStatus = {
+          storage_path: outputPath,
+          public_url: `http://localhost:${port}/api/clip/${id}/file`,
+          status: 'ready',
+        };
+      }
 
       console.log(`[job ${id}] ready - storagePath: ${finalJobStatus.storage_path}, publicUrl: ${finalJobStatus.public_url}`);
     } catch (err: unknown) {
@@ -300,13 +328,20 @@ app.post("/api/clip", async (req, res) => {
       if (tempCookiesPath && fs.existsSync(tempCookiesPath)) {
         fs.unlinkSync(tempCookiesPath);
       }
-      const { error: updateError } = await supabase
-        .from('jobs')
-        .update(finalJobStatus)
-        .eq('id', id);
+      if (SUPABASE_ENABLED && supabase) {
+        const { error: updateError } = await supabase
+          .from('jobs')
+          .update(finalJobStatus)
+          .eq('id', id);
 
-      if (updateError) {
-        console.error(`[job ${id}] failed to update final job status in database`, updateError);
+        if (updateError) {
+          console.error(`[job ${id}] failed to update final job status in database`, updateError);
+        }
+      } else {
+        const existing = localJobs.get(id);
+        if (existing) {
+          localJobs.set(id, { ...existing, ...(finalJobStatus as any) });
+        }
       }
     }
   })();
@@ -316,23 +351,36 @@ app.post("/api/clip", async (req, res) => {
 
 app.get('/api/clip/:id', async (req, res) => {
   const { id } = req.params;
-  
-  const { data: job, error } = await supabase
-    .from('jobs')
-    .select('*')
-    .eq('id', id)
-    .single();
 
-  if (error || !job) {
-    console.log(`[job ${id}] not found in database. Error:`, error?.message);
-    return res.status(404).json({ error: 'job not found'});
+  if (SUPABASE_ENABLED && supabase) {
+    const { data: job, error } = await supabase
+      .from('jobs')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (error || !job) {
+      console.log(`[job ${id}] not found in database. Error:`, error?.message);
+      return res.status(404).json({ error: 'job not found'});
+    }
+
+    return res.json({
+      status: job.status,
+      error: job.error,
+      url: job.public_url,
+      storagePath: job.storage_path,
+    });
   }
-  
-  return res.json({ 
-    status: job.status, 
-    error: job.error, 
+
+  const job = localJobs.get(id);
+  if (!job) {
+    return res.status(404).json({ error: 'job not found' });
+  }
+  return res.json({
+    status: job.status,
+    error: job.error,
     url: job.public_url,
-    storagePath: job.storage_path 
+    storagePath: job.storage_path,
   });
 });
 
@@ -340,18 +388,23 @@ app.get('/api/clip/:id', async (req, res) => {
 app.delete('/api/clip/:id/cleanup', async (req, res) => {
   const { id } = req.params;
 
-  // Delete the job row from database
-  const { error } = await supabase
-    .from('jobs')
-    .delete()
-    .eq('id', id);
+  if (SUPABASE_ENABLED && supabase) {
+    const { error } = await supabase
+      .from('jobs')
+      .delete()
+      .eq('id', id);
 
-  if (error && error.code !== 'PGRST116') {
-    console.error(`[job ${id}] job cleanup delete error:`, error);
-    return res.status(500).json({ error: 'Job cleanup failed' });
+    if (error && error.code !== 'PGRST116') {
+      console.error(`[job ${id}] job cleanup delete error:`, error);
+      return res.status(500).json({ error: 'Job cleanup failed' });
+    }
+  } else {
+    const filePath = path.join(uploadsDir, `clip-${id}.mp4`);
+    await fs.promises.unlink(filePath).catch(() => {});
+    localJobs.delete(id);
   }
 
-  console.log(`[job ${id}] job metadata cleaned up successfully from database`);
+  console.log(`[job ${id}] job metadata cleaned up successfully`);
   return res.json({ success: true });
 });
 
@@ -576,14 +629,18 @@ app.get("/api/test-supabase", async (req, res) => {
 
 // Clean up old job files on startup
 async function cleanupOldJobs() {
+  if (!SUPABASE_ENABLED || !supabase) {
+    console.log('Skipping db cleanup (local-only mode).');
+    return;
+  }
   const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-  
+
   console.log('Cleaning up old jobs from database...');
   const { data, error } = await supabase
     .from('jobs')
     .delete()
     .lt('created_at', twentyFourHoursAgo);
-  
+
   if (error) {
     console.error('Error during database job cleanup:', error);
   } else if (data) {

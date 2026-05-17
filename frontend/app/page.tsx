@@ -12,8 +12,15 @@ const fadeUpVariants = {
   animate: { opacity: 1, y: 0 },
 };
 
+// LOCAL-DEV: bypass auth entirely and render the editor directly.
+const LOCAL_DEV_BYPASS_AUTH = true;
+
 export default function App() {
   const { data: session, isPending } = authClient.useSession();
+
+  if (LOCAL_DEV_BYPASS_AUTH) {
+    return <Editor />;
+  }
 
   if (isPending) {
     return (

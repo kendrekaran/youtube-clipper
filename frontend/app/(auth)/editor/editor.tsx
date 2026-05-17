@@ -37,9 +37,15 @@ export default function Editor() {
   const [formats, setFormats] = useState<{format_id: string, label: string}[]>([]);
   const [selectedFormat, setSelectedFormat] = useState<string>('');
   const [isMetadataLoading, setIsMetadataLoading] = useState(true);
-  const { data: session } = authClient.useSession();
+  const { data: realSession } = authClient.useSession();
+  // LOCAL-DEV: fall back to a fake session so the editor works without auth.
+  const session = realSession ?? {
+    user: { id: 'local-user', name: 'Local User', email: 'local@dev.local' },
+  };
   const [downloadCount, setDownloadCount] = useState(0);
   const [showPremiumModal, setShowPremiumModal] = useState(false);
+  // LOCAL-DEV: skip the paywall entirely.
+  const LOCAL_DEV_BYPASS_PAYWALL = true;
   const getVideoId = (url: string) => {
     const regExp =
       /^.*((youtu.be\/)|(v\/)|(\/u\/\w\/)|(embed\/)|(watch\?))\??v?=?([^#&?]*).*/;
@@ -115,6 +121,11 @@ export default function Editor() {
   }, [session?.user?.id]);
 
   useEffect(() => {
+    if (LOCAL_DEV_BYPASS_PAYWALL) {
+      setIsPremium(true);
+      setShowPremiumModal(false);
+      return;
+    }
     const checkPremiumStatus = async () => {
       try {
         const response = await fetch("/api/user/premium");
