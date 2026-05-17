@@ -1,12 +1,33 @@
 import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
-import { spawn } from "child_process";
+import { spawn, spawnSync } from "child_process";
 import path from "path";
 import fs from "fs";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 dotenv.config();
+
+// Detect once whether the installed ffmpeg has the `subtitles` filter
+// (requires libass). Homebrew's slim ffmpeg ships without it, in which case
+// we'll soft-mux subtitles instead of burning them in.
+const FFMPEG_HAS_SUBTITLES_FILTER: boolean = (() => {
+  try {
+    const r = spawnSync('ffmpeg', ['-hide_banner', '-filters'], { encoding: 'utf8' });
+    const ok = /\bsubtitles\b/.test(r.stdout || '');
+    if (!ok) {
+      console.warn(
+        '[startup] ffmpeg is missing the `subtitles` filter (libass not built in). ' +
+        'Subtitles will be soft-muxed as mov_text instead of burned in. ' +
+        'For burned-in subs install a full ffmpeg (macOS: ' +
+        '`brew tap homebrew-ffmpeg/ffmpeg && brew install homebrew-ffmpeg/ffmpeg/ffmpeg`).'
+      );
+    }
+    return ok;
+  } catch {
+    return false;
+  }
+})();
 
 // --- Supabase setup (optional for local dev) ---
 const supabaseUrl = process.env.SUPABASE_URL as string | undefined;
@@ -238,15 +259,23 @@ app.post("/api/clip", async (req, res) => {
       }
 
       await new Promise<void>((resolve, reject) => {
+        const wantSubs = Boolean(subtitles && subtitlesExist);
+        // Use basenames + cwd=uploadsDir so the ffmpeg `subtitles` filter parser
+        // never sees colons or other special chars from absolute paths
+        // (especially important on Windows where paths look like `C:\...`).
+        const inputName = path.basename(outputPath);
+        const subName   = path.basename(subPath);
+        const fastName  = path.basename(fastPath);
+
         const ffmpegArgs = [
           '-y',
-          '-i', outputPath,
+          '-i', inputName,
         ];
 
-        if (subtitles && subtitlesExist) {
-          console.log(`[job ${id}] burning subtitles from ${subPath}`);
+        if (wantSubs && FFMPEG_HAS_SUBTITLES_FILTER) {
+          console.log(`[job ${id}] burning subtitles from ${subName}`);
           ffmpegArgs.push(
-            '-vf', `subtitles=${subPath}`,
+            '-vf', `subtitles=${subName}`,
             '-c:v', 'libx264',
             '-c:a', 'aac',
             '-b:a', '128k',
@@ -255,8 +284,20 @@ app.post("/api/clip", async (req, res) => {
             '-maxrate', '2M',        // Limit bitrate
             '-bufsize', '4M'         // Limit buffer size
           );
+        } else if (wantSubs) {
+          // libass not available: soft-mux the subs as a mov_text track so
+          // the user still gets toggle-able captions in the downloaded mp4.
+          console.log(`[job ${id}] soft-muxing subtitles (${subName}) — libass not available for burn-in`);
+          ffmpegArgs.push(
+            '-i', subName,
+            '-map', '0:v', '-map', '0:a', '-map', '1:0',
+            '-c:v', 'copy',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-c:s', 'mov_text',
+            '-metadata:s:s:0', 'language=eng'
+          );
         } else {
-          // No subtitles to burn – copy video but transcode audio to AAC to ensure MP4 compatibility
+          // No subtitles – copy video but transcode audio to AAC to ensure MP4 compatibility
           ffmpegArgs.push(
             '-c:v', 'copy', // keep original video
             '-c:a', 'aac',
@@ -267,11 +308,11 @@ app.post("/api/clip", async (req, res) => {
         // Move the `faststart` flag and output path outside the conditional so it applies to both modes
         ffmpegArgs.push(
           '-movflags', '+faststart',
-          fastPath
+          fastName
         );
 
-        console.log(`[job ${id}] running ffmpeg`, ffmpegArgs.join(' '));
-        const ff = spawn('ffmpeg', ffmpegArgs);
+        console.log(`[job ${id}] running ffmpeg (cwd=${uploadsDir})`, ffmpegArgs.join(' '));
+        const ff = spawn('ffmpeg', ffmpegArgs, { cwd: uploadsDir });
         
         // Add timeout for ffmpeg process
         const ffmpegTimeout = setTimeout(() => {
