@@ -173,26 +173,28 @@ app.post("/api/clip", async (req, res) => {
       ];
       // Format selection: always pick the ORIGINAL audio track (the one the
       // creator uploaded), never a YouTube dub. yt-dlp tags the original
-      // track with "original" in its format_note (e.g. "English (US) original
-      // (default), medium, m4a_dash"). The second branch is the fallback for
-      // single-language videos where no audio is tagged "original".
+      // track with "original" in its format_note.
+      //
+      // The cached formatId from /api/formats can become stale between
+      // requests because YouTube serves different format sets to different
+      // player_client responses (the SABR rotation, see yt-dlp issue
+      // #12482). So we always append a generic fallback chain after the
+      // user's choice — if their format ID disappeared, yt-dlp will fall
+      // through to the chain instead of erroring out with "Requested format
+      // is not available".
+      const ORIGINAL_FALLBACK_CHAIN = [
+        "bv[ext=mp4][vcodec^=avc1][height<=?1080][fps<=?60]+ba[format_note*=original]",
+        "bv[ext=mp4][vcodec^=avc1][height<=?1080][fps<=?60]+ba[ext=m4a]",
+        "b[format_note*=original]",
+        "b[language^=en]",
+        "best[ext=mp4][vcodec^=avc1][height<=?1080]",
+        "best",
+      ].join('/');
+
       if (formatId) {
-        // User picked a specific (usually video-only) format. Pair it with the
-        // original audio track, falling back to best m4a if not tagged.
-        const isCombined = String(formatId).includes('+');
-        const spec = isCombined
-          ? String(formatId)
-          : `${formatId}+ba[format_note*=original]/${formatId}+ba[ext=m4a]/${formatId}+ba/${formatId}`;
-        ytArgs.push("-f", spec);
+        ytArgs.push("-f", `${formatId}/${ORIGINAL_FALLBACK_CHAIN}`);
       } else {
-        ytArgs.push(
-          "-f",
-          [
-            "bv[ext=mp4][vcodec^=avc1][height<=?1080][fps<=?60]+ba[ext=m4a][format_note*=original]",
-            "bv[ext=mp4][vcodec^=avc1][height<=?1080][fps<=?60]+ba[ext=m4a]",
-            "best[ext=mp4][vcodec^=avc1][height<=?1080]",
-          ].join('/')
-        );
+        ytArgs.push("-f", ORIGINAL_FALLBACK_CHAIN);
       }
       ytArgs.push(
         "--download-sections",
@@ -582,42 +584,66 @@ app.get("/api/formats", async (req, res) => {
         const info = JSON.parse(jsonData);
         
         const MAX_PIXELS = 1920 * 1080;
-        
+
+        // Drop dub variants of multi-language progressive tracks. YouTube ships
+        // these as e.g. 301-0 (German dub), 301-1 (Hindi dub), ... 301-18
+        // ([en-US] original). For a given base format_id, keep only the
+        // "original" variant — otherwise the dropdown picks a dub.
+        const isDubVariant = (f: any) => {
+          if (!f.format_id || !f.format_id.includes('-')) return false;
+          const note = (f.format_note || '').toLowerCase();
+          if (note.includes('original')) return false;
+          const lang = (f.language || '').toLowerCase();
+          const looksLikeDub = Boolean(f.language) || /\[[a-z-]+\]/i.test(f.format_note || '');
+          return looksLikeDub && !lang.startsWith('en') ? true
+               : looksLikeDub; // any non-original variant -> drop
+        };
+
         const videoFormats = info.formats
-          .filter((f: any) => 
-            f.vcodec !== 'none' && 
+          .filter((f: any) =>
+            f.vcodec !== 'none' &&
             f.height && f.width &&
-            (f.width * f.height <= MAX_PIXELS) && 
-            (f.ext === 'mp4' || f.ext === 'webm')
+            (f.width * f.height <= MAX_PIXELS) &&
+            (f.ext === 'mp4' || f.ext === 'webm') &&
+            !isDubVariant(f)
           )
           .map((f: any) => ({
             format_id: f.format_id,
             label: `${f.height}p${f.fps > 30 ? f.fps : ''}`,
             height: f.height,
+            fps: f.fps || 0,
             hasAudio: f.acodec !== 'none',
-            ext: f.ext
+            isOriginal: ((f.format_note || '').toLowerCase().includes('original')),
+            ext: f.ext,
           }))
-          .sort((a: any, b: any) => b.height - a.height);
-        
-        // Remove duplicates based on height and keep the best format for each resolution
+          .sort((a: any, b: any) => (b.height - a.height) || (b.fps - a.fps));
+
+        // Dedup by label, preferring "original"-tagged formats, then audio-bearing.
         const uniqueFormats = videoFormats.reduce((acc: any[], current: any) => {
-          const existing = acc.find((item) => item.label === current.label);
-          if (!existing) {
+          const idx = acc.findIndex((item) => item.label === current.label);
+          if (idx === -1) {
             acc.push(current);
-          } else if (current.hasAudio && !existing.hasAudio) {
-            // Prefer formats with audio if available
-            const index = acc.findIndex((item) => item.label === current.label);
-            acc[index] = current;
+          } else {
+            const existing = acc[idx];
+            const currentScore = (current.isOriginal ? 2 : 0) + (current.hasAudio ? 1 : 0);
+            const existingScore = (existing.isOriginal ? 2 : 0) + (existing.hasAudio ? 1 : 0);
+            if (currentScore > existingScore) acc[idx] = current;
           }
           return acc;
         }, []);
-        
-        // If we need to use video-only formats, we'll use format selection that combines with best audio
-        const formatsForUser = uniqueFormats.map((f: any) => ({
-          format_id: f.hasAudio ? f.format_id : `${f.format_id}+bestaudio`,
-          label: f.label
-        }));
-        
+
+        // For video-only formats, pair with the ORIGINAL audio track (with
+        // sensible fallbacks). For progressive formats (already have audio),
+        // use as-is.
+        const formatsForUser = uniqueFormats.map((f: any) => {
+          if (f.hasAudio) {
+            return { format_id: f.format_id, label: f.label };
+          }
+          const v = f.format_id;
+          const spec = `${v}+ba[format_note*=original]/${v}+ba[ext=m4a]/${v}+ba/${v}`;
+          return { format_id: spec, label: f.label };
+        });
+
         return res.json({ formats: formatsForUser });
       } catch (e) {
           console.error('[formats] JSON parse error', e);
